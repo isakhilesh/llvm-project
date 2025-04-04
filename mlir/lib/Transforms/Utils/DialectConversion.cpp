@@ -724,6 +724,8 @@ public:
     return rewrite->getKind() == Kind::UnresolvedMaterialization;
   }
 
+  void rollback() override;
+
   UnrealizedConversionCastOp getOperation() const {
     return cast<UnrealizedConversionCastOp>(op);
   }
@@ -1091,6 +1093,13 @@ UnresolvedMaterializationRewrite::UnresolvedMaterializationRewrite(
   rewriterImpl.unresolvedMaterializations[op] = this;
 }
 
+void UnresolvedMaterializationRewrite::rollback() {
+  if (!mappedValues.empty())
+    rewriterImpl.mapping.erase(mappedValues);
+  rewriterImpl.unresolvedMaterializations.erase(getOperation());
+  op->erase();
+}
+
 void ConversionPatternRewriterImpl::applyRewrites() {
   // Commit all rewrites.
   IRRewriter rewriter(context, config.listener);
@@ -1112,13 +1121,26 @@ RewriterState ConversionPatternRewriterImpl::getCurrentState() {
   return RewriterState(rewrites.size(), ignoredOps.size(), replacedOps.size());
 }
 
-void ConversionPatternRewriterImpl::resetState(RewriterState state,
-                                               StringRef patternName) {
-  if (state.numRewrites != rewrites.size()) {
-    std::string errorMessage =
-        "pattern '" + std::string(patternName) + "' failed after modifying IR";
-    llvm_unreachable(errorMessage.c_str());
+void ConversionPatternRewriterImpl::resetState(RewriterState state, StringRef patternName) {
+  // Undo any rewrites.
+  unsigned numRewritesToKeep = state.numRewrites;
+  for (auto &rewrite :
+       llvm::reverse(llvm::drop_begin(rewrites, numRewritesToKeep))) {
+    if (!isa<UnresolvedMaterializationRewrite>(rewrite)) {
+      std::string errorMessage =
+          "pattern '" + std::string(patternName) + "' failed after modifying IR";
+      llvm_unreachable(errorMessage.c_str());
+    }
+    rewrite->rollback();
   }
+  rewrites.resize(numRewritesToKeep);
+
+  // Pop all of the recorded ignored operations that are no longer valid.
+  while (ignoredOps.size() != state.numIgnoredOperations)
+    ignoredOps.pop_back();
+
+  while (replacedOps.size() != state.numReplacedOps)
+    replacedOps.pop_back();
 }
 
 LogicalResult ConversionPatternRewriterImpl::remapValues(
@@ -2007,9 +2029,6 @@ OperationLegalizer::legalizeWithFold(Operation *op,
   if (replacementValues.empty())
     return legalize(op, rewriter);
 
-  // Insert a replacement for 'op' with the folded replacement values.
-  rewriter.replaceOp(op, replacementValues);
-
   // Recursively legalize any new constant operations.
   for (unsigned i = curState.numRewrites, e = rewriterImpl.rewrites.size();
        i != e; ++i) {
@@ -2018,10 +2037,16 @@ OperationLegalizer::legalizeWithFold(Operation *op,
     if (!createOp)
       continue;
     if (failed(legalize(createOp->getOperation(), rewriter))) {
-      return op->emitError("failed to legalize generated constant '")
-             << createOp->getOperation()->getName() << "'";
+      LLVM_DEBUG(logFailure(rewriterImpl.logger,
+                            "failed to legalize generated constant '{0}'",
+                            createOp->getOperation()->getName()));
+      //rewriterImpl.resetState(curState);
+      return failure();
     }
   }
+
+  // Insert a replacement for 'op' with the folded replacement values.
+  rewriter.replaceOp(op, replacementValues);
 
   LLVM_DEBUG(logSuccess(rewriterImpl.logger, ""));
   return success();
